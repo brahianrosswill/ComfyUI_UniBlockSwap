@@ -131,8 +131,14 @@ class SwappableModuleList(nn.ModuleList):
         raise AttributeError(f"'{type(self).__name__}' has no attribute '{name}'")
 
     def __getitem__(self, idx):
+        # Support slicing: blocks[start:end]
+        if isinstance(idx, slice):
+            start, stop, step = idx.indices(self.total_count)
+            return [self[i] for i in range(start, stop, step)]
+
         if idx >= self.non_swap_count:
             self._load_swap(idx - self.non_swap_count)
+
         return super().__getitem__(idx)
 
     def __iter__(self):
