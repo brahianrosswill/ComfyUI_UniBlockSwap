@@ -115,13 +115,9 @@ class SwappableModuleList(nn.ModuleList):
                 else:
                     # Safetensor: set to meta (vbar restores automatically)
                     _free_to_meta(prev_mod)
-                for m in prev_mod.modules():
-                    for attr in ('_v', '_prefetch', '_v_signature'):
-                        if hasattr(m, attr):
-                            try:
-                                delattr(m, attr)
-                            except Exception:
-                                pass
+                # NOTE: vbar state (_v/_prefetch/_v_signature) is intentionally
+                # left untouched - vbar is READ-ONLY here and restores the block
+                # on its own fault mechanism.
             except Exception:
                 pass
         # LOAD current block if GGUF
@@ -150,13 +146,7 @@ class SwappableModuleList(nn.ModuleList):
                     _restore_ggml_refs(blk)
                 else:
                     _free_to_meta(blk)
-                for m in blk.modules():
-                    for attr in ('_v', '_prefetch', '_v_signature'):
-                        if hasattr(m, attr):
-                            try:
-                                delattr(m, attr)
-                            except Exception:
-                                pass
+                # vbar state left untouched (read-only by design)
             except Exception:
                 pass
         self._loaded_swap_idx = -1

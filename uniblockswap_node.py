@@ -3,6 +3,7 @@ import torch
 import comfy.model_management as mm
 import comfy.patcher_extension
 import gc
+import uuid
 from .block_swap import install_block_swap, install_te_block_swap, _free_to_meta, _has_ggml_params
 
 logger = logging.getLogger(__name__)
@@ -48,8 +49,7 @@ def _free_block_cleanup(swl):
             else:
                 _free_to_meta(blk)
             for m in blk.modules():
-                for attr in ('_v', '_prefetch', '_v_signature',
-                             'ggml_weight', 'ggml_weight_data'):
+                for attr in ('ggml_weight', 'ggml_weight_data'):
                     if hasattr(m, attr):
                         try:
                             delattr(m, attr)
@@ -57,6 +57,54 @@ def _free_block_cleanup(swl):
                             pass
         except Exception:
             pass
+
+
+def _ensure_lora_functions(patcher, swl):
+    """Attach LoRA LowVramPatch functions to every swap block module.
+
+    This reuses the LoRA patches ComfyUI already attached (patcher.patches) -
+    no weight data is re-read and nothing is re-wrapped. ComfyUI's cast path
+    applies module.weight_function (incl. vbar fault restore, ops.py post_cast),
+    so LoRA stays effective every time a swap block is loaded into CUDA.
+    """
+    if getattr(patcher, "mmap_released", False):
+        return  # GGUF: keep original dequant/cast path behavior
+    import comfy.model_patcher as mp
+    patches = getattr(patcher, "patches", None)
+    if not patches:
+        return
+    full_path = None
+    for path, mod in patcher.model.named_modules():
+        if mod is swl:
+            full_path = path
+            break
+    if full_path is None:
+        return
+    for i in range(swl.non_swap_count, swl.total_count):
+        try:
+            blk = swl._modules.get(str(i))
+            if blk is None:
+                continue
+            prefix = f"{full_path}.{i}"
+            for mname, m in blk.named_modules():
+                base = prefix if not mname else f"{prefix}.{mname}"
+                for pname in ("weight", "bias"):
+                    key = f"{base}.{pname}"
+                    if key not in patches:
+                        continue
+                    try:
+                        _, set_func, convert_func = mp.get_key_weight(
+                            patcher.model, key)
+                    except Exception:
+                        continue
+                    fn = mp.LowVramPatch(key, patches, convert_func, set_func)
+                    attr_name = pname + "_function"
+                    cur = list(getattr(m, attr_name, None) or [])
+                    if not any(getattr(f, "key", None) == key for f in cur):
+                        cur.append(fn)
+                        setattr(m, attr_name, cur)
+        except Exception:
+            continue
 
 
 def clear_comfyui_cache_except(exclude_patcher=None):
@@ -100,6 +148,12 @@ class UniBlockSwap:
     CATEGORY = "model/loaders"
     DESCRIPTION = "Swap blocks one-at-a-time between GPU/CPU to reduce VRAM."
 
+    # NOTE: no IS_CHANGED on purpose. apply_swap() is a one-time install step
+    # (wraps the shared model object in SwappableModuleList + attaches LoRA
+    # weight_functions). Forcing re-execution every run would re-wrap the
+    # already-wrapped model (nested swap) and break swap + LoRA state.
+    # Per-inference VRAM cleanup of TE/VAE is handled by the separate
+    # UniBlockSwapCacheControl node, which re-runs every inference.
     def apply_swap(self, model, num_blocks=-1):
         if num_blocks == 0:
             return (model,)
@@ -113,6 +167,18 @@ class UniBlockSwap:
         if diffusion_model is None:
             logger.warning("UniBlockSwap: no diffusion model found")
             return (patcher,)
+
+        # Re-entry guard: model.clone() shares the SAME underlying model object
+        # (no deepcopy). If this node re-runs on an already-swapped model (e.g.
+        # num_blocks changed -> input changed -> node re-executed), fully restore
+        # the original structure first, otherwise install_block_swap would wrap
+        # the SwappableModuleList again (nested) and break swap/LoRA state.
+        prev_cleanup = getattr(diffusion_model, "_uniblockswap_cleanup", None)
+        if prev_cleanup is not None:
+            try:
+                prev_cleanup()
+            except Exception:
+                logger.warning("UniBlockSwap: failed to restore previous swap before reinstall", exc_info=True)
 
         compute = mm.get_torch_device()
         offload = mm.unet_offload_device()
@@ -140,6 +206,8 @@ class UniBlockSwap:
         def _on_load(p, device_to, lowvram, force, full):
             try:
                 mgr.offload_swap_blocks()
+                for swl in _dit_all_swls:
+                    _ensure_lora_functions(p, swl)
                 for key in list(p.backup.keys()):
                     if _is_dit_swap_key(key):
                         p.backup.pop(key, None)
@@ -153,32 +221,28 @@ class UniBlockSwap:
             "UniBlockSwap", _on_load,
         )
 
-        # Detect if this patcher is a GGUFModelPatcher (which handles GGMLTensor weights).
-        _is_gguf = hasattr(patcher, 'mmap_released')
-
+        # Swap blocks: never write LoRA-patched weights back into parameters
+        # here. LoRA is applied at cast time via weight_function
+        # (_ensure_lora_functions), otherwise it would double-apply.
         _orig_patch = patcher.patch_weight_to_device
         def _skip_swap_patch(key, *args, **kwargs):
             if _is_dit_swap_key(key):
-                if _is_gguf:
-                    # GGUF: completely skip. _load_swap manages GPU loading.
-                    return
-                # Safetensor: call original, delete backup.
-                result = _orig_patch(key, *args, **kwargs)
-                if key in patcher.backup:
-                    patcher.backup.pop(key, None)
-                return result
+                return
             return _orig_patch(key, *args, **kwargs)
         patcher.patch_weight_to_device = _skip_swap_patch
 
-        # CRITICAL: _load_list filter for GGUF to prevent load() from
-        # iterating over swap blocks and calling m.to(device_to) on each,
-        # which would load all GGUF swap blocks to GPU at once (12GB spike).
-        if _is_gguf:
-            _orig_load_list = patcher._load_list
-            def _filtered_load_list(*args, **kwargs):
-                raw = _orig_load_list(*args, **kwargs)
-                return [item for item in raw if not _is_dit_swap_key(item[-3])]
-            patcher._load_list = _filtered_load_list
+        # CRITICAL: filter swap blocks from _load_list so load() never
+        # iterates over them (m.to(device_to) would load all swap blocks to
+        # GPU at once). Blocks are loaded one-at-a-time by swap + vbar fault.
+        _orig_load_list = patcher._load_list
+        def _filtered_load_list(*args, **kwargs):
+            raw = _orig_load_list(*args, **kwargs)
+            return [item for item in raw if not _is_dit_swap_key(item[-3])]
+        patcher._load_list = _filtered_load_list
+
+        # Attach LoRA weight_functions to swap blocks (idempotent).
+        for swl in _dit_all_swls:
+            _ensure_lora_functions(patcher, swl)
 
         def _on_dit_cleanup(p):
             try:
@@ -222,6 +286,8 @@ class UniBlockSwapTE:
     CATEGORY = "model/loaders"
     DESCRIPTION = "Swap text encoder blocks one-at-a-time between GPU/CPU to reduce VRAM."
 
+    # NOTE: no IS_CHANGED on purpose (see UniBlockSwap comment). Per-inference
+    # VRAM cleanup of the text encoder is handled by UniBlockSwapCacheControl.
     def apply_swap(self, clip, num_blocks=-1):
         if num_blocks == 0:
             return (clip,)
@@ -231,6 +297,16 @@ class UniBlockSwapTE:
         if cond_stage is None:
             logger.warning("UniBlockSwapTE: no cond_stage_model found")
             return (new_clip,)
+
+        # Re-entry guard: clip.clone() shares the same underlying model object.
+        # Restore any previously installed TE swap structure before reinstalling
+        # to avoid nesting SwappableModuleList / double-wrapping forward.
+        prev_cleanup = getattr(new_clip.patcher.model, "_uniblockswap_te_cleanup", None)
+        if prev_cleanup is not None:
+            try:
+                prev_cleanup()
+            except Exception:
+                logger.warning("UniBlockSwapTE: failed to restore previous swap before reinstall", exc_info=True)
 
         new_clip.patcher.backup = {}
         mm.soft_empty_cache()
@@ -278,6 +354,8 @@ class UniBlockSwapTE:
 
         def _on_load(p, device_to, lowvram, force, full):
             _purge_swap_from_backup(p)
+            for mgr in mgr_list:
+                _ensure_lora_functions(p, mgr)
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -300,6 +378,9 @@ class UniBlockSwapTE:
             return [item for item in raw if not _is_swap_key(item[-3])]
         new_clip.patcher._load_list = _filtered_load_list
 
+        for mgr in mgr_list:
+            _ensure_lora_functions(new_clip.patcher, mgr)
+
         new_clip.patcher.model._uniblockswap_te_cleanup = cleanup
 
         def _on_cleanup(p):
@@ -320,11 +401,50 @@ class UniBlockSwapTE:
         return (new_clip,)
 
 
+class UniBlockSwapCacheControl:
+    """Per-inference VRAM cleanup for the other models (TE/VAE), passthrough.
+
+    UniBlockSwap / UniBlockSwapTE no longer force re-execution via IS_CHANGED
+    (re-running would re-wrap the shared model object and break swap/LoRA).
+    Instead this node re-runs every inference but only performs the cheap
+    clear_comfyui_cache_except() side effect, leaving swap installation intact.
+
+    Usage: UniBlockSwap -> UniBlockSwapCacheControl -> KSampler
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {"model": ("MODEL",)},
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    RETURN_NAMES = ("model",)
+    FUNCTION = "clear_cache"
+    CATEGORY = "model/loaders"
+    DESCRIPTION = ("每次推理清除除传入 model 外的其他模型(TE/VAE 等)的显存,"
+                   "并原样透传 model。放在 UniBlockSwap 之后、KSampler 之前。"
+                   "替代原先用 IS_CHANGED 强制 UniBlockSwap 重跑的做法,"
+                   "避免重复安装 swap 导致 LoRA 失效。")
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        # Re-run every inference, but this node only clears cache - it does not
+        # reinstall swap, so it has no destructive side effects.
+        return uuid.uuid4().hex
+
+    def clear_cache(self, model):
+        clear_comfyui_cache_except(model)
+        return (model,)
+
+
 NODE_CLASS_MAPPINGS = {
     "UniBlockSwap": UniBlockSwap,
     "UniBlockSwapTE": UniBlockSwapTE,
+    "UniBlockSwapCacheControl": UniBlockSwapCacheControl,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "UniBlockSwap": "UniBlockSwap",
     "UniBlockSwapTE": "UniBlockSwap TE",
+    "UniBlockSwapCacheControl": "UniBlockSwap Cache Control",
 }
