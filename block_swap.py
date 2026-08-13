@@ -1,7 +1,38 @@
 """
-UniBlockSwap - Universal single-block swap for ComfyUI.
-Safetensor blocks: freed to meta on swap, restored by vbar automatically.
-GGUF blocks: freed to CPU on swap, moved to GPU when accessed.
+UniBlockSwap - Universal block swap for ComfyUI (fixed-resident prefix).
+
+num_blocks is the inference LOOP mechanism, not a loading mechanism:
+  - num_blocks blocks form a PERMANENT-RESIDENT PREFIX: blocks 0..num_blocks-1
+    are pushed into CUDA once at install time and stay resident for the whole
+    inference (no transfers while the loop runs over them). The remaining
+    blocks (num_blocks..total-1) stay on the ORIGINAL lazy path: the GGUF
+    plugin dequantizes + transfers each layer inside forward() (overlapped
+    with compute; ComfyUI vbar manages VRAM), no swap ops run on the tail.
+    Everything (prefix included) is released when inference ends (ON_CLEANUP /
+    offload_swap_blocks).
+  -1 / <=0 -> prefix of 1 block
+  1 <= N < total -> prefix of N blocks (N blocks resident up front)
+  N >= total  -> no swap (entire model resident)
+
+Load/unload per block type (the GGUF plugin's loading mechanism is UNCHANGED):
+  Safetensor: swap blocks are filtered out of patcher._load_list, so they
+  NEVER get a vbar _v alloc - ComfyUI's vbar cast path is not involved at
+  all. They run on ComfyUI's PLAIN cast path (resolve_cast_module_with_vbar
+  falls through when hasattr(s, "_v") is False), which transfers weights from
+  CPU/mmap inside forward() every step. Prefix blocks are therefore preloaded
+  the same way as GGUF: module.to(compute_device) moves the whole block onto
+  CUDA up front, so the plain cast path sees weight.device == device and
+  skips the transfer - zero per-layer stalls over the resident prefix. A
+  reference to the original (mmap-backed) param data is kept for release.
+  On unload the params are pointed back at the original data (pointer
+  assignment, no anonymous RAM), same idea as the GGUF branch.
+  GGUF: for every resident block (prefix or current tail) the whole block's
+  quantized weights are moved onto CUDA up front (module.to(compute_device),
+  GGMLTensor metadata kept), so the blocks are GPU-resident when the loop
+  reaches them; the GGUF plugin's own forward-time dequantization then runs
+  against resident data (no per-layer mmap->CUDA stall). On release the params
+  are pointed back at the original mmap GGMLTensors (pointer assignment, no
+  anonymous RAM).
 """
 
 import gc
@@ -27,10 +58,28 @@ def find_blocks(model):
     return None, None
 
 
+def _is_ggml_tensor(t):
+    """True if `t` carries GGMLTensor metadata (quantized or torch-compatible
+    GGUF weight). Check both the object itself and its .data - nn.Parameter()
+    on a Tensor subclass drops __init__ attrs, and torch.Tensor.data returns
+    self for GGMLTensor (detach() -> self), so both paths are covered."""
+    if t is None:
+        return False
+    if getattr(t, "tensor_type", None) is not None:
+        return True
+    try:
+        d = t.data
+        if d is not t and getattr(d, "tensor_type", None) is not None:
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _has_ggml_params(module):
     """Check if module has GGMLTensor parameters (quantized GGUF weights)."""
     for p in module.parameters():
-        if hasattr(p, 'tensor_type'):
+        if _is_ggml_tensor(p):
             return True
     return False
 
@@ -48,8 +97,8 @@ def _backup_ggml_refs(module):
         return
     backup = {}
     for name, param in module.named_parameters(recurse=True):
-        t = param.data
-        if hasattr(t, "tensor_type"):      # a GGMLTensor
+        t = param if _is_ggml_tensor(param) else param.data
+        if _is_ggml_tensor(t):             # a GGMLTensor
             backup[name] = t               # keep the object alive, mmap intact
     module._ggml_mmap_backup = backup
 
@@ -72,10 +121,36 @@ def _restore_ggml_refs(module):
         p = params.get(name)
         if p is not None:
             p.data = orig
+    # any plain (non-GGML) params that _load_block's module.to() moved to CUDA
+    # must come back to the offload device too
+    offload = module.offload_device if hasattr(module, "offload_device") else "cpu"
+    offload_t = torch.device(offload)
+    for p in module.parameters(recurse=True):
+        if p.device.type != offload_t.type:
+            p.data = p.data.to(offload)
     # free the GPU copy of the now-unreferenced tensor
     if torch.cuda.is_available():
         gc.collect()
         torch.cuda.empty_cache()
+
+
+def _is_gguf_block(module):
+    """A block is GGUF if we captured its original mmap GGMLTensor refs at
+    install time. This flag - not _has_ggml_params - is the source of truth:
+    a block whose params were .to(cuda)'d still counts as GGUF so load/offload
+    take the pointer-assignment path instead of the vbar/meta path.
+    """
+    return bool(getattr(module, "_ggml_mmap_backup", None))
+
+
+def _has_meta_params(module):
+    """True if the block's params are still meta (model weights not staged
+    yet - happens at install time, before ComfyUI loads the safetensor).
+    Nothing can be transferred in that state, so preload must be skipped."""
+    for p in module.parameters(recurse=True):
+        if getattr(p, "device", None) is not None and p.device.type == "meta":
+            return True
+    return False
 
 
 def _free_to_meta(module):
@@ -85,91 +160,187 @@ def _free_to_meta(module):
         param.data = torch.empty(0, device='meta')
 
 
+def _backup_param_refs(module):
+    """Preserve the ORIGINAL (CPU/staged) param .data objects for a safetensor
+    block before it is moved to CUDA, so unload can point params back without
+    reallocation. Generic counterpart of _backup_ggml_refs for non-GGML params.
+    """
+    if getattr(module, "_param_ref_backup", None) is not None:
+        return
+    backup = {}
+    for name, param in module.named_parameters(recurse=True):
+        backup[name] = param.data
+    module._param_ref_backup = backup
+
+
+def _restore_param_refs(module):
+    """Point params back at the original (CPU/staged) data and drop any GPU
+    copies. Pointer assignment (p.data = orig) - NO anonymous heap allocation.
+    No-op if the block was never backed up (still CPU)."""
+    backup = getattr(module, "_param_ref_backup", None)
+    if not backup:
+        module.to(module.offload_device if hasattr(module, "offload_device") else "cpu")
+        return
+    params = dict(module.named_parameters(recurse=True))
+    for name, orig in backup.items():
+        p = params.get(name)
+        if p is not None:
+            p.data = orig
+    if torch.cuda.is_available():
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
 class SwappableModuleList(nn.ModuleList):
-    def __init__(self, modules, compute_device, offload_device,
-                 non_swap_count=0):
+    """ModuleList with a fixed-resident prefix; tail stays on the lazy path.
+
+    prefix_count (= num_blocks) blocks are pushed into CUDA once and stay
+    resident for the whole inference (no sliding, no transfers while the loop
+    runs over them). The tail blocks (prefix_count..total-1) are deliberately
+    left untouched: eager per-step tail swapping re-transfers the whole tail on
+    every loop pass (the loop restarts at block 0) with blocking transfers and
+    empty_cache churn - slower than the plugin's lazy per-layer path. The
+    plugin dequantizes + transfers tail layers inside forward(), overlapped
+    with compute. Everything (prefix included) is released when inference ends
+    via offload_swap_blocks() / ON_CLEANUP.
+    """
+
+    def __init__(self, modules, compute_device, offload_device, window_size=1):
         super().__init__(modules)
         self.compute_device = compute_device
         self.offload_device = offload_device
-        self.non_swap_count = non_swap_count
+        self.window_size = max(1, window_size)
         self.total_count = len(modules)
-        self._loaded_swap_idx = -1
+        # num_blocks -> how many leading blocks are kept resident in CUDA for
+        # the whole inference.
+        self.prefix_count = min(self.window_size, self.total_count)
+        # Kept at 0 for compatibility with the node file (cleanup / LoRA
+        # traversal cover ALL blocks, prefix included).
+        self.non_swap_count = 0
+        self._prefix_loaded = False  # prefix blocks resident in CUDA?
         self.container_name = ''
 
-    def _load_swap(self, local_idx):
-        idx = local_idx + self.non_swap_count
-        if local_idx == self._loaded_swap_idx:
+    def _offload_block(self, idx):
+        try:
+            blk = self._modules[str(idx)]
+            if _is_gguf_block(blk):
+                # GGUF: restore the original mmap-backed GGMLTensor by pointer
+                # assignment (no anon RAM, no GPU round trip). If the block was
+                # never loaded the backup is empty and the helper safely falls
+                # back to a no-op .to(cpu).
+                _restore_ggml_refs(blk)
+            else:
+                # Safetensor: point params back at the original (CPU/staged)
+                # data. Swap blocks never have a vbar _v (they are filtered out
+                # of _load_list), so meta would leave them unrestorable - the
+                # pointer assignment keeps the source data alive instead.
+                _restore_param_refs(blk)
+            # NOTE: no vbar state (_v/_prefetch/_v_signature) exists for swap
+            # blocks - they were filtered out of _load_list, so they never got
+            # a vbar alloc and run on the plain cast path instead.
+        except Exception:
+            pass
+
+    def _preload_safetensor_block(self, idx, blk):
+        """Explicitly preload a safetensor block into CUDA so the block is
+        GPU-resident before the loop reaches it - same effect as the GGUF
+        branch.
+
+        NOTE: safetensor swap blocks NEVER get a vbar _v - they are filtered
+        out of patcher._load_list by the node, so _v = vbar.alloc() inside
+        patcher.load() never runs for them. They execute on ComfyUI's PLAIN
+        cast path (resolve_cast_module_with_vbar falls through when
+        hasattr(s, "_v") is False), which re-transfers weights from CPU/mmap
+        inside forward() on every step. A bare blk.to(compute_device) is
+        therefore exactly right here: once weight.device == device, the plain
+        cast path skips the transfer and the block stays GPU-resident.
+
+        Blocks whose params are still meta (model weights not staged yet, e.g.
+        at install time) are skipped - the lazy cast path takes over and the
+        next preload pass (after patcher.load() materializes the weights)
+        actually transfers.
+        """
+        try:
+            if _has_meta_params(blk):
+                logger.info("UniBlockSwap: load block %d (safetensor, weights not staged - lazy)",
+                            idx)
+                return
+            _backup_param_refs(blk)
+            blk.to(self.compute_device)
+            logger.info("UniBlockSwap: load block %d (safetensor, resident)", idx)
+        except Exception as e:
+            logger.warning("UniBlockSwap: safetensor preload block %d failed (%s) - "
+                           "falling back to lazy cast", idx, e)
+
+    def _load_block(self, idx):
+        blk = self._modules[str(idx)]
+        if _is_gguf_block(blk):
+            # GGUF: transfer the WHOLE block onto CUDA UP FRONT, keeping every
+            # GGMLTensor's metadata (tensor_type/tensor_shape/patches) intact.
+            # We do NOT dequantize here - the GGUF plugin dequantizes inside
+            # forward() (its shape logic must not be bypassed). Moving the
+            # quantized weights ahead of the loop means the plugin's lazy
+            # dequantization runs against CUDA-resident data: the per-layer
+            # mmap->CUDA transfer inside the inference loop disappears.
+            _backup_ggml_refs(blk)
+            blk.to(self.compute_device)
+            logger.info("UniBlockSwap: load block %d (GGUF, resident)", idx)
+        else:
+            # Safetensor: preload the whole block with a plain .to(cuda) so
+            # the prefix is CUDA-resident like the GGUF branch (the plain cast
+            # path then sees weight.device == device and skips the transfer).
+            self._preload_safetensor_block(idx, blk)
+
+    def load_prefix(self):
+        """Push the permanent-resident prefix blocks (0..prefix_count-1) into
+        CUDA in one go. Idempotent. Called at install time and again lazily on
+        first access (e.g. after an ON_LOAD offload wiped the prefix)."""
+        if self.prefix_count <= 0 or self._prefix_loaded:
             return
-        if self._loaded_swap_idx >= 0:
-            prev = self._loaded_swap_idx + self.non_swap_count
-            try:
-                prev_mod = self._modules[str(prev)]
-                # FREE previous block GPU memory
-                if _has_ggml_params(prev_mod):
-                    # GGUF: restore the original mmap-backed GGMLTensor by
-                    # pointer assignment. This drops the GPU copy WITHOUT
-                    # reallocating the weights as anonymous CPU RAM (which
-                    # .to(offload_device) would do after a .to(cuda) round
-                    # trip, blowing RAM from 40G to 60G).
-                    _restore_ggml_refs(prev_mod)
-                else:
-                    # Safetensor: set to meta (vbar restores automatically)
-                    _free_to_meta(prev_mod)
-                # NOTE: vbar state (_v/_prefetch/_v_signature) is intentionally
-                # left untouched - vbar is READ-ONLY here and restores the block
-                # on its own fault mechanism.
-            except Exception:
-                pass
-        # LOAD current block if GGUF
-        cur_mod = self._modules[str(idx)]
-        if _has_ggml_params(cur_mod):
-            # Snapshot the mmap reference so we can later restore it. We do NOT
-            # call cur_mod.to(compute_device) here: GGUF weights are dequantized
-            # per-layer on demand inside GGMLLayer.cast_bias_weight() when each
-            # op runs (self.weight.to(input.device)). Pre-moving the whole block
-            # to GPU would force a full dequantization of every layer at once,
-            # spiking VRAM and -- on the next swap -- a GPU->"CPU" round trip,
-            # both of which defeat the mmap model's whole point.
-            _backup_ggml_refs(cur_mod)
-        # else: safetensor - vbar handles restoration
-        self._loaded_swap_idx = local_idx
+        logger.info("UniBlockSwap: preload prefix [0,%d) into CUDA (num_blocks=%d)",
+                    self.prefix_count, self.window_size)
+        for j in range(self.prefix_count):
+            self._load_block(j)
+        self._prefix_loaded = True
+
+    def _ensure_window(self, idx):
+        """Ensure the resident prefix is in CUDA.
+
+        Prefix blocks (idx < prefix_count) are loaded once and stay resident
+        for the whole inference - zero transfers during the loop. Tail blocks
+        (idx >= prefix_count) are deliberately NOT touched: eagerly swapping
+        them re-transfers the whole tail on every step (the loop restarts at
+        block 0, so the previous step's last tail block must be released and
+        re-loaded), with blocking transfers + empty_cache churn - slower than
+        the plugin's lazy per-layer path. The plugin handles them inside
+        forward() (dequant + transfer, overlapped with compute).
+        """
+        if idx < self.prefix_count:
+            if not self._prefix_loaded:
+                self.load_prefix()
 
     def offload_swap_blocks(self):
-        for i in range(self.non_swap_count, self.total_count):
-            try:
-                blk = self._modules[str(i)]
-                if _has_ggml_params(blk):
-                    # Restore the original mmap-backed GGMLTensor (pointer
-                    # assignment, no anonymous RAM). If a block was never
-                    # GPU-loaded the backup is empty and the helper safely
-                    # falls back to a no-op .to(cpu).
-                    _restore_ggml_refs(blk)
-                else:
-                    _free_to_meta(blk)
-                # vbar state left untouched (read-only by design)
-            except Exception:
-                pass
-        self._loaded_swap_idx = -1
+        """Release ALL blocks (prefix included) and reset swap state. Called
+        when inference ends (ON_CLEANUP / TE forward finally / model unload).
+        Tail blocks lazily dequantized by the plugin are pointed back at mmap
+        too, so VRAM returns to baseline."""
+        for i in range(self.total_count):
+            self._offload_block(i)
+        self.reset_swap_state()
+
+    def reset_swap_state(self):
+        """Forget residency state so the next inference re-preloads the prefix.
+        Blocks are already released by the caller; this only resets flags."""
+        self._prefix_loaded = False
 
     def _apply(self, fn, recurse=True):
-        """Apply fn to non-swap blocks only.
-        
-        CRITICAL: Prevents model.to(device_to) from moving swap block
-        GGMLTensors to GPU, which would cause a VRAM spike (12GB).
-        Safetensor swap blocks are already meta (no-op), so this only
-        affects GGUF paths.
-        
-        nn.ModuleList._apply(recurse=False) applies fn to all _modules
-        entries INCLUDING swap blocks. We skip that and handle only
-        non_swap_count blocks manually.
+        """Do NOT move any block with model.to(...).
+
+        All blocks are swap-managed: safetensor blocks are meta (no-op) and
+        GGUF blocks must stay mmap-backed on CPU (a .to(gpu) here would force
+        a full dequantization VRAM spike). nn.ModuleList._apply would apply fn
+        to every child - we skip that entirely.
         """
-        for i in range(self.non_swap_count):
-            try:
-                child = self._modules.get(str(i))
-                if child is not None:
-                    child._apply(fn, recurse)
-            except Exception:
-                pass
         return self
 
     def __getattr__(self, name):
@@ -187,8 +358,8 @@ class SwappableModuleList(nn.ModuleList):
             start, stop, step = idx.indices(self.total_count)
             return [self[i] for i in range(start, stop, step)]
 
-        if idx >= self.non_swap_count:
-            self._load_swap(idx - self.non_swap_count)
+        if 0 <= idx < self.total_count:
+            self._ensure_window(idx)
 
         return super().__getitem__(idx)
 
@@ -206,36 +377,55 @@ def install_block_swap(diffusion_model, compute_device, offload_device,
             all_containers.append((name, c))
 
     if not all_containers:
-        return None, lambda: None, set()
+        return None, lambda: None, set(), []
 
     first_swl = None
     all_names = set()
 
     for name, orig in all_containers:
         total = len(orig)
-        n = num_blocks if num_blocks > 0 else total
-        n = max(1, min(n, total))
+        # num_blocks = number of leading blocks kept resident in CUDA for the
+        # whole inference (prefix). -1 / <=0 -> 1; 1..total-1 -> N; >= total ->
+        # no swap.
+        win = num_blocks if num_blocks > 0 else 1
+        win = max(1, min(win, total))
+        if num_blocks > 0 and win >= total:
+            logger.info("UniBlockSwap: '%s' = %d blocks, NO swap (num_blocks=%d >= total)",
+                         name, total, num_blocks)
+            continue
 
         swl = SwappableModuleList(
             orig, compute_device, offload_device,
-            non_swap_count=total - n,
+            window_size=win,
         )
         swl.container_name = name
         setattr(diffusion_model, name, swl)
         all_names.add(name)
         if first_swl is None:
             first_swl = swl
-        logger.info("UniBlockSwap: '%s' = %d blocks, swapping %d",
-                     name, total, n)
 
-        # For GGUF: the swap blocks already live in the mmap file-backed mapping
-        # on CPU. No copy is needed now; we just record the original references
-        # so a later offload can restore them (pointer assignment, no anon RAM).
-        # Safetensor blocks stay on GPU (original behavior).
-        for i in range(total - n, total):
-            blk = swl._modules[str(i)]
-            if _has_ggml_params(blk):
-                _backup_ggml_refs(blk)
+        # Every block participates: the first `win` blocks form the resident
+        # prefix (pushed into CUDA once, kept for the whole inference); the
+        # rest stay on the plugin's original lazy path. GGUF blocks keep their
+        # mmap refs (dequantized on demand by the GGUF plugin); safetensor
+        # blocks are restored by vbar on access.
+        n_gguf = 0
+        for i in range(total):
+            if _has_ggml_params(swl._modules[str(i)]):
+                _backup_ggml_refs(swl._modules[str(i)])
+                n_gguf += 1
+        logger.info("UniBlockSwap: '%s' GGUF blocks: %d/%d", name, n_gguf, total)
+
+        logger.info("UniBlockSwap: '%s' = %d blocks, prefix resident = %d, tail lazy (num_blocks=%d)",
+                     name, total, swl.prefix_count, num_blocks)
+
+        # Push the resident prefix into CUDA right away: blocks 0..win-1 are
+        # GPU-resident before inference starts and stay there until it ends.
+        swl.load_prefix()
+
+    if first_swl is None:
+        # num_blocks >= total for every container -> no swap at all.
+        return None, lambda: None, set(), []
 
     orig_fwd = diffusion_model.forward
 
@@ -300,12 +490,16 @@ def install_te_block_swap(cond_stage_model, compute_device, offload_device,
 
     for name, orig, parent in containers:
         total = len(orig)
-        n = num_blocks if num_blocks > 0 else total
-        n = max(1, min(n, total))
+        win = num_blocks if num_blocks > 0 else 1
+        win = max(1, min(win, total))
+        if num_blocks > 0 and win >= total:
+            logger.info("UniBlockSwapTE: '%s' (%s) = %d blocks, NO swap (num_blocks=%d >= total)",
+                         name, type(parent).__name__, total, num_blocks)
+            continue
 
         swl = SwappableModuleList(
             orig, compute_device, offload_device,
-            non_swap_count=total - n,
+            window_size=win,
         )
         swl.container_name = name
         setattr(parent, name, swl)
@@ -317,16 +511,24 @@ def install_te_block_swap(cond_stage_model, compute_device, offload_device,
             parent_to_mgrs[parent_id] = (parent, parent.forward, [])
         parent_to_mgrs[parent_id][2].append(swl)
 
-        logger.info("UniBlockSwapTE: '%s' (%s) = %d blocks, swapping %d",
-                     name, type(parent).__name__, total, n)
+        # Every block participates: the first `win` blocks form the resident
+        # prefix (pushed into CUDA once, kept for the whole inference); the
+        # rest stay on the plugin's original lazy path. GGUF blocks keep their
+        # mmap refs (dequantized on demand by the GGUF plugin); safetensor
+        # blocks are restored by vbar on access.
+        n_gguf = 0
+        for i in range(total):
+            if _has_ggml_params(swl._modules[str(i)]):
+                _backup_ggml_refs(swl._modules[str(i)])
+                n_gguf += 1
+        logger.info("UniBlockSwap: '%s' GGUF blocks: %d/%d", name, n_gguf, total)
 
-        for i in range(total - n, total):
-            blk = swl._modules[str(i)]
-            if _has_ggml_params(blk):
-                # Record mmap references; the block stays file-backed on CPU.
-                _backup_ggml_refs(blk)
-            else:
-                _free_to_meta(blk)
+        logger.info("UniBlockSwapTE: '%s' (%s) = %d blocks, prefix resident = %d, tail lazy (num_blocks=%d)",
+                     name, type(parent).__name__, total, swl.prefix_count, num_blocks)
+
+        # Push the resident prefix into CUDA right away. The TE forward wrapper
+        # offloads everything (prefix included) when the TE run finishes.
+        swl.load_prefix()
 
     wrapped_parents = []
     for parent_id, (parent, orig_fwd, parent_mgrs) in parent_to_mgrs.items():
